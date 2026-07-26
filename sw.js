@@ -28,10 +28,11 @@ function cancelOne(id) {
 
 async function fire(item) {
   timers.delete(item.id);
+  const iconUrl = new URL('./icon.svg', self.registration.scope).toString();
   await self.registration.showNotification(`💬 ${item.contactName}`, {
     body: item.message.length > 90 ? item.message.slice(0, 90) + '…' : item.message,
-    icon: '/icon.svg',
-    badge: '/icon.svg',
+    icon: iconUrl,
+    badge: iconUrl,
     tag: item.id,
     data: { waUrl: item.waUrl, id: item.id },
     requireInteraction: true,

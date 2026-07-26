@@ -502,6 +502,7 @@
 <!-- TOAST -->
 <div class="toast" id="toast"></div>
 
+<script src="scheduler-utils.js"></script>
 <script>
 // ═══════════════════════════════════════════════════════
 //  STATE & STORAGE
@@ -510,6 +511,47 @@ let contacts = [];
 let scheduled = [];
 let editContactId = null;
 let schedContact = null; // selected contact in schedule form
+const APP_BASE = schedulerUtils.resolveBasePath(window.location.pathname);
+
+function getAppUrl(path) {
+  return schedulerUtils.resolveAppUrl(path, APP_BASE);
+}
+
+async function showNotificationFor(item) {
+  if (Notification.permission !== 'granted') {
+    showError('Cannot show reminder: notifications permission is not granted');
+    return false;
+  }
+
+  const payload = {
+    title: `💬 ${item.contactName}`,
+    body: item.message.length > 90 ? `${item.message.slice(0, 90)}…` : item.message,
+    icon: getAppUrl('icon.svg'),
+    badge: getAppUrl('icon.svg'),
+    tag: item.id,
+    data: { waUrl: item.waUrl, id: item.id },
+    requireInteraction: true,
+    actions: [{ action: 'open', title: 'Open WhatsApp' }]
+  };
+
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.ready;
+      await reg.showNotification(payload.title, payload);
+      return true;
+    }
+  } catch (error) {
+    showError(`Service worker notification failed: ${error?.message || error}`);
+  }
+
+  try {
+    new Notification(payload.title, payload);
+    return true;
+  } catch (error) {
+    showError(`Notification failed: ${error?.message || error}`);
+    return false;
+  }
+}
 
 function loadData() {
   contacts = JSON.parse(localStorage.getItem('wa_contacts') || '[]');
@@ -547,6 +589,11 @@ function showToast(msg, ms=2600) {
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), ms);
 }
 
+function showError(msg) {
+  console.error(msg);
+  showToast(`Error: ${msg}`, 5000);
+}
+
 // ═══════════════════════════════════════════════════════
 //  VIEW SWITCHING
 // ═══════════════════════════════════════════════════════
@@ -579,6 +626,11 @@ function renderScheduled() {
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
       <span class="nb-text">Enable notifications to get reminders at the scheduled time</span>
       <button class="nb-btn" onclick="requestNotifPermission()">Enable</button>
+    </div>`;
+  } else if (Notification.permission === 'denied') {
+    html += `<div class="nb">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      <span class="nb-text">Notifications are blocked. Open browser settings and allow notifications for this site.</span>
     </div>`;
   }
 
@@ -855,7 +907,7 @@ function selectContact(id) {
   closeCPicker();
 }
 
-function saveSchedule() {
+async function saveSchedule() {
   const msg = document.getElementById('sched-msg').value.trim();
   const dtVal = document.getElementById('sched-dt').value;
   const manualPhone = document.getElementById('manual-phone').value.trim();
@@ -872,6 +924,13 @@ function saveSchedule() {
 
   if (!msg) { showToast('Please enter a message'); return; }
   if (!dtVal) { showToast('Please pick a date and time'); return; }
+
+  if (Notification.permission === 'default') {
+    const granted = await requestNotifPermission();
+    if (!granted) {
+      showToast('Enable notifications to receive reminders');
+    }
+  }
 
   const ts = new Date(dtVal).getTime();
   if (isNaN(ts) || ts <= Date.now()) { showToast('Please pick a future date/time'); return; }
@@ -926,36 +985,65 @@ async function handleNotifBtn() {
 }
 
 async function requestNotifPermission() {
-  if (!('Notification' in window)) { showToast('Notifications not supported'); return; }
-  const r = await Notification.requestPermission();
-  updateNotifBtn();
-  if (r==='granted') {
-    showToast('🔔 Notifications enabled!');
+  if (!('Notification' in window)) {
+    showError('Notifications are not supported by this browser');
     renderScheduled();
-    resendAllToSW();
-  } else {
-    showToast('Notifications blocked in browser settings');
+    return false;
+  }
+  if (Notification.permission==='granted') {
+    updateNotifBtn();
+    return true;
+  }
+  if (Notification.permission==='denied') {
+    updateNotifBtn();
+    showError('Notifications are blocked in browser settings');
+    renderScheduled();
+    return false;
+  }
+
+  try {
+    const r = await Notification.requestPermission();
+    updateNotifBtn();
+    if (r==='granted') {
+      showToast('🔔 Notifications enabled!');
+      renderScheduled();
+      resendAllToSW();
+      return true;
+    }
+
+    showError('Notifications blocked in browser settings');
+    renderScheduled();
+    return false;
+  } catch (error) {
+    showError(`Notification permission request failed: ${error.message || error}`);
+    renderScheduled();
+    return false;
   }
 }
 
-function checkDue() {
-  const now = Date.now(); let changed = false;
-  scheduled.forEach(s => {
-    if (s.status==='pending' && s.time <= now) {
-      if (Notification.permission==='granted') {
-        navigator.serviceWorker.ready.then(reg => {
-          reg.showNotification(`💬 ${s.contactName}`, {
-            body: s.message.length>90 ? s.message.slice(0,90)+'…' : s.message,
-            icon: '/icon.svg', badge: '/icon.svg',
-            tag: s.id, data: { waUrl: s.waUrl, id: s.id },
-            requireInteraction: true
-          });
-        }).catch(()=>{});
+async function checkDue() {
+  const now = Date.now();
+  let changed = false;
+  let deniedReported = false;
+
+  for (const s of scheduled) {
+    if (s.status !== 'pending' || s.time > now) continue;
+    if (Notification.permission === 'denied') {
+      if (!deniedReported) {
+        showError('Notifications are blocked. Pending reminders cannot be delivered.');
+        deniedReported = true;
       }
-      s.status = 'notified'; changed = true;
+      s.status = 'missed';
+      changed = true;
+      continue;
     }
-  });
-  if (changed) { saveScheduled(); if(currentView==='scheduled') renderScheduled(); }
+
+    const success = await showNotificationFor(s);
+    s.status = success ? 'notified' : 'missed';
+    changed = true;
+  }
+
+  if (changed) { saveScheduled(); if (currentView === 'scheduled') renderScheduled(); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -964,16 +1052,21 @@ function checkDue() {
 async function registerSW() {
   if (!('serviceWorker' in navigator)) return;
   try {
-    await navigator.serviceWorker.register('/sw.js');
+    const swUrl = getAppUrl('sw.js');
+    const scope = getAppUrl('.');
+    await navigator.serviceWorker.register(swUrl, { scope });
     navigator.serviceWorker.addEventListener('message', e => {
       if (e.data.type==='FIRED') {
         const s = scheduled.find(x=>x.id===e.data.id);
         if (s && s.status==='pending') { s.status='notified'; saveScheduled(); if(currentView==='scheduled') renderScheduled(); }
       }
       if (e.data.type==='OPEN_WA') window.open(e.data.waUrl, '_blank');
+      if (e.data.type==='ERROR') showError(`Worker error: ${e.data.message || 'unknown'}`);
     });
     resendAllToSW();
-  } catch(e) { console.log('SW registration failed:', e); }
+  } catch (e) {
+    showError(`Service worker registration failed: ${e.message || e}`);
+  }
 }
 
 async function sendToSW(item) {
@@ -981,7 +1074,9 @@ async function sendToSW(item) {
   try {
     const reg = await navigator.serviceWorker.ready;
     reg.active?.postMessage({ type:'SCHEDULE', data:item });
-  } catch(e){}
+  } catch (e) {
+    showError(`Failed to schedule reminder in service worker: ${e.message || e}`);
+  }
 }
 
 async function cancelInSW(id) {
@@ -989,7 +1084,9 @@ async function cancelInSW(id) {
   try {
     const reg = await navigator.serviceWorker.ready;
     reg.active?.postMessage({ type:'CANCEL', data:{id} });
-  } catch(e){}
+  } catch (e) {
+    showError(`Failed to cancel reminder in service worker: ${e.message || e}`);
+  }
 }
 
 async function resendAllToSW() {
@@ -998,7 +1095,9 @@ async function resendAllToSW() {
     const reg = await navigator.serviceWorker.ready;
     const pending = scheduled.filter(s=>s.status==='pending' && s.time>Date.now());
     reg.active?.postMessage({ type:'RESCHEDULE_ALL', data:{ items:pending } });
-  } catch(e){}
+  } catch (e) {
+    showError(`Failed to resend reminders to service worker: ${e.message || e}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1023,7 +1122,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   await registerSW();
   checkDue();
   renderAll();
-  setInterval(checkDue, 30000);
+  setInterval(checkDue, 5000);
 
   // Add some sample data if completely empty
   if (contacts.length === 0 && scheduled.length === 0) {
